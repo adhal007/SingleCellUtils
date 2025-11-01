@@ -1,1 +1,11 @@
 *data
+*scripts*
+*.sh*
+*.log*
+*.err* 
+*.out* 
+*outputs*
+*png*
+*pyc*
+*checkpoint*
+__pycache__/
