@@ -1,3 +1,4 @@
+from scipy.spatial.distance import cdist
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -39,10 +40,13 @@ class BaseTFIdentityPipeline(ABC):
         chipseq_file: str = None,
         known_identity_tfs: List[str] = None,
         verbose: bool = True,
-        jsd_method: Literal['jsd', 'bhattacharyya', 'geometric_jsd', 'all'] = 'jsd',
-        expr_method: Literal['scgx', 'expr_density'] = 'scgx',
+        jsd_method: Literal['jsd', 'bhattacharyya', 'geometric_jsd', 'mmd'] = 'jsd',
+        expr_method: Literal['scgx', 'expr_density', 'iqr_threshold', 'wilcoxon'] = 'wilcoxon',
         main_filter: Literal['high_only', 'unique_only', 'high_and_unique'] = 'high_and_unique',
-        n_processes: int = None
+        n_processes: int = None,
+        top_n_high: int = 100,
+        top_jsd_pc: float = 0.05,
+        top_n_jsd: int = 50
     ):
         """
         Initialize base pipeline.
@@ -66,13 +70,16 @@ class BaseTFIdentityPipeline(ABC):
         self.jsd_method = jsd_method
         self.expr_method = expr_method
         self.main_filter = main_filter
+        self.top_n_high = top_n_high
+        self.top_jsd_pc = top_jsd_pc
+        self.top_n_jsd = top_n_jsd
         # Parallel processing settings
         self.n_processes = n_processes or min(cpu_count() - 1, 8)
         self.chunk_size = 10  # Process genes in chunks
 
-        # Required files
-        if scgx_sig_file is None:
-            raise ValueError("Single-cell gene expression signature file is required")
+        # # Required files
+        # if scgx_sig_file is None:
+        #     raise ValueError("Single-cell gene expression signature file is required")
         self.scgx_sig_file = scgx_sig_file
         
         # Optional files
@@ -128,93 +135,318 @@ class BaseTFIdentityPipeline(ABC):
             self.mu_other_all = np.mean(self.X_other, axis=0)
         else:
             self.mu_other_all = np.zeros(self.X_dense.shape[1])
-    
+
+# ========================================================================
+# METHODS FOR SPECIFICITY CALCULATION
+# =======================================================================
     # ========================================================================
     # STATIC METHOD FOR PARALLEL PROCESSING
     # ========================================================================
-    
     @staticmethod
     def _compute_jsd_single_gene_parallel(gene_data: Tuple, method: str = 'jsd') -> Tuple[str, float]:
         """
-        Static method to compute JSD for a single gene (for parallel processing).
-        
-        Args:
-            gene_data: Tuple of (gene_name, target_expr, n_target, mu_other)
-            method: Divergence method
-            
-        Returns:
-            Tuple of (gene_name, jsd_score)
+        Compute per-gene specificity score across target cells.
+
+        Parameters
+        ----------
+        gene_data : Tuple
+            Expected formats:
+              - (gene_name, target_expr, n_target, mu_other)
+                backwards-compatible: mu_other is mean expression in the 'other' population.
+              - (gene_name, target_expr, n_target, mu_other, n_other, total_cells)
+                extended: includes the number of 'other' cells and total cell count (used by PMI).
+        method : str
+            One of: 'jsd' (arithmetic JSD), 'geometric_jsd', 'alpha_jsd', 'bhattacharyya',
+                    'hellinger', 'pmi'
+        alpha : float
+            For 'alpha_jsd' or 'geometric_jsd' (geometric_jsd uses alpha=0.5).
+        Returns
+        -------
+        (gene_name, score_sum)
+          score_sum is the sum of per-target-cell scores (matching your original API).
+          Note: for methods like PMI you may prefer a single summary score (we compute a per-cell
+          contribution and sum for API compatibility).
         """
-        gene_name, target_expr, n_target, mu_other = gene_data
-        
+
+        # Unpack gene_data supporting both 4- and 6-tuple formats
+        if len(gene_data) == 4:
+            gene_name, target_expr, n_target, mu_other = gene_data
+            n_other = None
+            total_cells = None
+        elif len(gene_data) == 6:
+            gene_name, target_expr, n_target, mu_other, n_other, total_cells = gene_data
+        else:
+            raise ValueError("gene_data must be a 4-tuple or 6-tuple. Received length: {}".format(len(gene_data)))
+
+        # Ensure target_expr is an array
+        target_expr = np.asarray(target_expr, dtype=float)
+        if len(target_expr) != n_target:
+            # warning: lengths mismatch - prefer to trust provided n_target but we'll use len()
+            n_target = len(target_expr)
+
+        eps = 1e-12  # small stabilizer for logs / denominators
         score_sum = 0.0
-        
+
+        # Precompute some sums if needed (PMI)
+        sum_target_expr = float(np.sum(target_expr))
+        if n_other is not None:
+            sum_other_expr_est = float(mu_other) * float(n_other)
+            total_expr_est = sum_target_expr + sum_other_expr_est
+        else:
+            total_expr_est = None
+
+        # iterate per target cell (keeps original behaviour)
         for i in range(n_target):
-            x_cell = target_expr[i]
-            
-            # Create distributions
+            x_cell = float(target_expr[i])
+
             denom = x_cell + mu_other
-            
-            if denom == 0:
-                score_sum += 1.0
-            else:
-                # p = [x_cell/(x_cell + mu_other), mu_other/(x_cell + mu_other)]
-                p0 = x_cell / denom
-                p1 = mu_other / denom
-                
-                # q = [1, 0] (reference distribution)
-                q0 = 1.0
-                q1 = 0.0
-                
-                if method == 'jsd':
-                    # Standard JSD with arithmetic mean
-                    m0 = 0.5 * (p0 + q0)
-                    m1 = 0.5 * (p1 + q1)
-                    
-                    # JSD = 0.5 * KL(p||m) + 0.5 * KL(q||m)
-                    kl_pm = 0.0
-                    if p0 > 0:
-                        kl_pm += p0 * np.log2(p0 / m0)
-                    if p1 > 0:
-                        kl_pm += p1 * np.log2(p1 / m1)
-                    
-                    kl_qm = q0 * np.log2(q0 / m0)
-                    score = 0.5 * (kl_pm + kl_qm)
-                    
-                elif method == 'bhattacharyya':
-                    bc_coefficient = np.sqrt(p0 * q0) + np.sqrt(p1 * q1)
-                    score = 1 - bc_coefficient
-                    
-                elif method == 'geometric_jsd':
-                    gm0_unnorm = np.sqrt(p0 * q0)
-                    gm1_unnorm = np.sqrt(p1 * q1)
-                    
-                    gm_sum = gm0_unnorm + gm1_unnorm
-                    if gm_sum > 0:
-                        m0 = gm0_unnorm / gm_sum
-                        m1 = gm1_unnorm / gm_sum
-                    else:
-                        m0 = 0.5 * (p0 + q0)
-                        m1 = 0.5 * (p1 + q1)
-                    
-                    kl_pm = 0.0
-                    if p0 > 0 and m0 > 0:
-                        kl_pm += p0 * np.log2(p0 / m0)
-                    if p1 > 0 and m1 > 0:
-                        kl_pm += p1 * np.log2(p1 / m1)
-                    
-                    kl_qm = 0.0
-                    if q0 > 0 and m0 > 0:
-                        kl_qm += q0 * np.log2(q0 / m0)
-                    if q1 > 0 and m1 > 0:
-                        kl_qm += q1 * np.log2(q1 / m1)
-                    
-                    score = 0.5 * (kl_pm + kl_qm)
-                
+
+            # If both are zero -> identical distributions => divergence 0.
+            if denom == 0.0:
+                score = 0.0
                 score_sum += score
+                continue
+
+            # two-bin pmf for this cell
+            p0 = x_cell / denom
+            p1 = mu_other / denom
+
+            # reference q: point mass on first bin
+            q0 = 1.0
+            q1 = 0.0
+
+            # Numerical safety
+            p0_safe = max(p0, eps)
+            p1_safe = max(p1, eps)
+            q0_safe = max(q0, eps)
+            q1_safe = max(q1, eps)
+
+            if method == 'jsd':
+                # arithmetic-mean JSD
+                m0 = 0.5 * (p0 + q0)
+                m1 = 0.5 * (p1 + q1)
+                m0 = max(m0, eps)
+                m1 = max(m1, eps)
+
+                kl_pm = 0.0
+                if p0 > 0.0:
+                    kl_pm += p0 * np.log2(p0_safe / m0)
+                if p1 > 0.0:
+                    kl_pm += p1 * np.log2(p1_safe / m1)
+
+                kl_qm = 0.0
+                # q0 = 1
+                kl_qm += q0 * np.log2(q0_safe / m0)
+
+                score = 0.5 * (kl_pm + kl_qm)
+
+            elif method in ('geometric_jsd', 'alpha_jsd'):
+                # alpha controls the geometric interpolation; alpha=0.5 is geometric JSD
+                if method == 'geometric_jsd':
+                    alpha_used = 0.5
+                else:
+                    alpha: float = 0.5
+                    alpha_used = float(alpha)
+                    if not (0.0 < alpha_used <= 1.0):
+                        raise ValueError("alpha must be in (0,1]. Got: {}".format(alpha_used))
+
+                # geometric interpolation in log space
+                log_m0 = alpha_used * np.log(p0_safe) + (1.0 - alpha_used) * np.log(q0_safe)
+                log_m1 = alpha_used * np.log(p1_safe) + (1.0 - alpha_used) * np.log(q1_safe)
+                m0 = np.exp(log_m0)
+                m1 = np.exp(log_m1)
+                m_sum = m0 + m1
+                m0 /= m_sum
+                m1 /= m_sum
+                m0 = max(m0, eps)
+                m1 = max(m1, eps)
+
+                kl_pm = 0.0
+                if p0 > eps:
+                    kl_pm += p0 * np.log2(p0_safe / m0)
+                if p1 > eps:
+                    kl_pm += p1 * np.log2(p1_safe / m1)
+
+                kl_qm = 0.0
+                if q0 > eps:
+                    kl_qm += q0 * np.log2(q0_safe / m0)
+                if q1 > eps:
+                    kl_qm += q1 * np.log2(q1_safe / m1)
+
+                score = 0.5 * (kl_pm + kl_qm)
+
+            elif method == 'bhattacharyya':
+                # BC = sum(sqrt(p_i * q_i)) = sqrt(p0 * q0) + sqrt(p1 * q1)
+                bc = np.sqrt(p0_safe * q0_safe) + np.sqrt(p1_safe * q1_safe)
+                # Convert BC to dissimilarity in [0,1]: 1 - BC (note: not a metric but convenient)
+                # bc is <= sqrt(1*1)+... but with two bins and proper normalization bc <= 1
+                score = max(0.0, 1.0 - bc)
+
+            elif method == 'hellinger':
+                # Hellinger distance: H = (1/sqrt(2)) * sqrt(sum (sqrt(p)-sqrt(q))^2)
+                h = np.sqrt((np.sqrt(p0_safe) - np.sqrt(q0_safe))**2 + (np.sqrt(p1_safe) - np.sqrt(q1_safe))**2)
+                score = (1.0 / np.sqrt(2.0)) * h  # in [0,1]
+
+            elif method == 'pmi':
+                # PMI requires knowledge of n_other and total_cells to compute marginals.
+                if (n_other is None) or (total_expr_est is None) or (total_cells is None):
+                    raise ValueError("PMI requires gene_data to contain n_other and total_cells "
+                                     "(use 6-tuple: gene_name, target_expr, n_target, mu_other, n_other, total_cells).")
+
+                # Compute approximate p(tf, c), p(tf), p(c) using expression mass
+                # p(tf, c) ≈ sum_target_expr / total_expr_all
+                # p(tf) ≈ (sum_target_expr + sum_other_expr_est) / total_expr_all
+                # p(c) ≈ n_target / total_cells
+                sum_other_expr_est = mu_other * n_other
+                total_expr_all = sum_target_expr + sum_other_expr_est + eps
+
+                p_tf_c = (sum_target_expr + eps) / total_expr_all
+                p_tf = (sum_target_expr + sum_other_expr_est + eps) / total_expr_all
+                p_c = (n_target + eps) / (total_cells + eps)
+
+                # PMI (can be negative). We'll use Positive PMI (PPMI) or a normalized variant.
+                raw_pmi = np.log2((p_tf_c) / (p_tf * p_c + eps) + eps)
+                # Convert to a bounded positive score: e.g., positive PMI normalized by a log factor.
+                # We map raw_pmi in [-inf, +inf] to [0,1] by sigmoid-like transform (but keep interpretability)
+                # Simple scaling: max(0, raw_pmi) / (1 + max(0, raw_pmi))
+                pos_pmi = max(0.0, raw_pmi)
+                score = pos_pmi / (1.0 + pos_pmi)
+
+            else:
+                raise ValueError(f"Unknown method: {method}")
+
+            # ensure non-negative and finite
+            if not np.isfinite(score) or score < 0.0:
+                score = max(0.0, float(np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)))
+
+            score_sum += score
+
+        return gene_name, float(score_sum)        
+
+    def compute_mmd_for_gene(self, gene: str, kernel: str = 'rbf') -> float:
+        """
+        Compute MMD for a single gene.
+        """
+        if gene not in self.adata.var_names:
+            return 0.0
         
-        return gene_name, score_sum
-    
+        gene_idx = np.where(self.adata.var_names == gene)[0][0]
+        
+        # Extract gene expression
+        X_target_gene = self.X_target[:, gene_idx].reshape(-1, 1)
+        X_other_gene = self.X_other[:, gene_idx].reshape(-1, 1) if self.X_other is not None else np.array([]).reshape(-1, 1)
+        
+        n_target = len(X_target_gene)
+        n_other = len(X_other_gene)
+        
+        if n_target == 0 or n_other == 0:
+            return 0.0
+        
+        # Subsample if too many cells
+        max_cells = 500
+        if n_target > max_cells:
+            idx = np.random.choice(n_target, max_cells, replace=False)
+            X_target_gene = X_target_gene[idx]
+            n_target = max_cells
+        
+        if n_other > max_cells:
+            idx = np.random.choice(n_other, max_cells, replace=False)
+            X_other_gene = X_other_gene[idx]
+            n_other = max_cells
+        
+        # Compute RBF kernel MMD
+        # Auto-tune gamma
+        combined = np.vstack([X_target_gene, X_other_gene])
+        if combined.shape[0] > 1:
+
+            pairwise_dists = cdist(combined, combined, 'euclidean')
+            pairwise_dists = pairwise_dists[pairwise_dists > 0]
+            if len(pairwise_dists) > 0:
+                median_dist = np.median(pairwise_dists)
+                gamma = 1.0 / (2 * median_dist ** 2) if median_dist > 0 else 1.0
+            else:
+                gamma = 1.0
+        else:
+            gamma = 1.0
+        
+        # Kernel matrices
+        K_tt = np.exp(-gamma * cdist(X_target_gene, X_target_gene, 'sqeuclidean'))
+        K_oo = np.exp(-gamma * cdist(X_other_gene, X_other_gene, 'sqeuclidean'))
+        K_to = np.exp(-gamma * cdist(X_target_gene, X_other_gene, 'sqeuclidean'))
+        
+        # MMD^2
+        term1 = np.sum(K_tt) / (n_target * n_target)
+        term2 = np.sum(K_oo) / (n_other * n_other)
+        term3 = 2 * np.sum(K_to) / (n_target * n_other)
+        
+        mmd_squared = term1 + term2 - term3
+        mmd = np.sqrt(max(0, mmd_squared))
+        
+        return mmd
+
+
+
+    # Static method for parallel MMD computation
+    @staticmethod
+    def _compute_mmd_single_gene_parallel(gene_data: Tuple) -> Tuple[str, float]:
+        """Static method for parallel MMD computation."""
+
+        
+        gene_name, target_expr, other_expr, n_target_orig, n_other_orig = gene_data
+        
+        # Reshape for kernel computation
+        X_target = target_expr.reshape(-1, 1)
+        X_other = other_expr.reshape(-1, 1)
+        
+        n_target = n_target_orig
+        n_other = n_other_orig
+        
+        if n_target == 0 or n_other == 0:
+            return gene_name, 0.0
+        
+        # Subsample if needed
+        max_cells = 500
+        if n_target > max_cells:
+            idx = np.random.choice(n_target, max_cells, replace=False)
+            X_target = X_target[idx]
+            n_target = max_cells
+        
+        if n_other > max_cells:
+            idx = np.random.choice(n_other, max_cells, replace=False)
+            X_other = X_other[idx]
+            n_other = max_cells
+        
+        # Compute RBF kernel MMD
+        combined = np.vstack([X_target, X_other])
+        if combined.shape[0] > 1:
+            pairwise_dists = cdist(combined, combined, 'euclidean')
+            pairwise_dists = pairwise_dists[pairwise_dists > 0]
+            if len(pairwise_dists) > 0:
+                median_dist = np.median(pairwise_dists)
+                gamma = 1.0 / (2 * median_dist ** 2) if median_dist > 0 else 1.0
+            else:
+                gamma = 1.0
+        else:
+            gamma = 1.0
+        
+        # Kernel matrices
+        K_tt = np.exp(-gamma * cdist(X_target, X_target, 'sqeuclidean'))
+        K_oo = np.exp(-gamma * cdist(X_other, X_other, 'sqeuclidean'))
+        K_to = np.exp(-gamma * cdist(X_target, X_other, 'sqeuclidean'))
+        
+        # MMD^2
+        term1 = np.sum(K_tt) / (n_target * n_target)
+        term2 = np.sum(K_oo) / (n_other * n_other)
+        term3 = 2 * np.sum(K_to) / (n_target * n_other)
+        
+        mmd_squared = term1 + term2 - term3
+        mmd = np.sqrt(max(0, mmd_squared))
+        
+        return gene_name, mmd
+
+
+
+
     # ========================================================================
     # MULTIPROCESSING METHOD
     # ========================================================================
@@ -273,6 +505,57 @@ class BaseTFIdentityPipeline(ABC):
         
         return jsd_scores
     
+    # Enhanced multiprocess method for MMD
+    def multiprocess_mmd(self, genes: List[str]) -> Dict[str, float]:
+        """
+        Compute MMD scores for multiple genes using multiprocessing.
+        """
+        # Prepare data for parallel processing
+        gene_data_list = []
+        
+        for gene in genes:
+            if gene not in self.adata.var_names:
+                continue
+            
+            gene_idx = np.where(self.adata.var_names == gene)[0][0]
+            
+            # For MMD, we need both target and other expression
+            target_expr = self.X_target[:, gene_idx]
+            other_expr = self.X_other[:, gene_idx] if self.X_other is not None else np.array([])
+            
+            gene_data_list.append((
+                gene, 
+                target_expr, 
+                other_expr,
+                self.n_target, 
+                self.n_other
+            ))
+        
+        if not gene_data_list:
+            return {}
+        
+        # Create partial function
+        compute_func = self._compute_mmd_single_gene_parallel
+        
+        # Parallel computation
+        if self.verbose:
+            print(f"    Using {self.n_processes} processes for MMD computation...")
+        
+        with Pool(processes=self.n_processes) as pool:
+            if self.verbose:
+                results = list(tqdm(
+                    pool.imap(compute_func, gene_data_list, chunksize=self.chunk_size),
+                    total=len(gene_data_list),
+                    desc=f"    Computing MMD",
+                    disable=False
+                ))
+            else:
+                results = pool.map(compute_func, gene_data_list, chunksize=self.chunk_size)
+        
+        # Convert to dictionary
+        scores = dict(results)
+        
+        return scores
     # ========================================================================
     # CORE FILTERING METHODS (High Expression & Uniqueness)
     # ========================================================================
@@ -325,11 +608,87 @@ class BaseTFIdentityPipeline(ABC):
         gene_density = np.sum(X > 0, axis=0) / X.shape[0]
         
         # Filter TFs
-        passed_filter = gene_density >= p + p_std
+        passed_filter = gene_density >= p
         filtered_tfs = [tf for tf, passed in zip(tf_genes, passed_filter) if passed]
         print(f"TFs passing filter: {len(filtered_tfs)}/{len(tf_genes)}")
         
         return filtered_tfs
+
+    def filter_tfs_by_iqr(self):
+        """
+        Filter TFs by expression density using IQR threshold
+        
+        Keep only TFs with expression density > Q1 - 1.5*IQR
+        (removes low-expression outliers)
+        
+        Args:
+            self: Object with adata_target, tf_list, target_cell_type attributes
+            
+        Returns:
+            filtered_tfs: List of TF gene symbols passing the filter
+        """
+        
+        print(f"\nTarget cell type: {self.target_cell_type}")
+        print(f"Cells: {self.adata_target.n_obs}")
+        print(f"Genes: {self.adata_target.n_vars}")
+        
+        # Get TF expression matrix
+        tf_genes = [g for g in self.tf_list if g in self.adata_target.var_names]
+        
+        print(f"\nTFs in dataset: {len(tf_genes)}/{len(self.tf_list)}")
+        
+        adata_tfs = self.adata_target[:, tf_genes].copy()
+        
+        # Get expression matrix
+        if issparse(adata_tfs.X):
+            X = adata_tfs.X.toarray()
+        else:
+            X = adata_tfs.X
+        
+        # Calculate density for each gene (proportion of cells expressing it)
+        gene_density = np.sum(X > 0, axis=0) / X.shape[0]
+        
+        # Calculate IQR statistics
+        q1 = np.percentile(gene_density, 25)
+        q3 = np.percentile(gene_density, 75)
+        iqr = q3 - q1
+        median = np.median(gene_density)
+        
+        # IQR outlier threshold (lower bound)
+        lower_threshold = q1 - 1.5 * iqr
+        
+        print(f"\nExpression density statistics:")
+        print(f"  Q1 (25th percentile): {q1:.4f}")
+        print(f"  Median (50th percentile): {median:.4f}")
+        print(f"  Q3 (75th percentile): {q3:.4f}")
+        print(f"  IQR: {iqr:.4f}")
+        print(f"  Lower threshold (Q1 - 1.5*IQR): {lower_threshold:.4f}")
+        
+        # Filter TFs - keep those above lower threshold
+        passed_filter = gene_density > lower_threshold
+        filtered_tfs = [tf for tf, passed in zip(tf_genes, passed_filter) if passed]
+        
+        print(f"\nTFs passing filter: {len(filtered_tfs)}/{len(tf_genes)}")
+        print(f"TFs removed: {len(tf_genes) - len(filtered_tfs)}")
+        
+        return filtered_tfs
+    
+    def filter_by_wilcoxon(self):
+        # Get TF expression matrix
+        tf_genes = [g for g in self.tf_list if g in self.adata_target.var_names]
+
+        adata_tfs = self.adata[:, tf_genes].copy()
+        # Very fast implementation
+        sc.tl.rank_genes_groups(adata_tfs  , groupby='cell_type', 
+                                method='wilcoxon',
+                                reference='rest',
+                                groups=[self.target_cell_type])
+
+        # Extract top markers
+        markers = sc.get.rank_genes_groups_df(adata_tfs, group=self.target_cell_type)
+        top_genes = markers[markers['pvals_adj'] < 0.05].head(self.top_n_high)
+        high_tfs = top_genes['names'].to_list()
+        return high_tfs
     
     def filter_high_expression(self) -> List[str]:
         """
@@ -349,20 +708,76 @@ class BaseTFIdentityPipeline(ABC):
             high_tfs = [tf for tf in high_tfs if tf in self.tf_list]
             
 
-        else:
+        elif self.expr_method == 'expr_density':
             high_tfs = self.filter_tfs_by_expression_density()
 
+        elif self.expr_method == 'iqr_threshold':
+            high_tfs = self.filter_tfs_by_iqr()
+        
+        elif self.expr_method == 'wilcoxon':
+            high_tfs = self.filter_by_wilcoxon()
+        
         if self.verbose:
             print(f"  High expression TFs: {len(high_tfs)}/{len(self.tf_list)}")
 
         return high_tfs
-    
+    @staticmethod
+    def _find_jsd_threshold_simple(jsd_values, method='iqr'):
+        """Simple, interpretable threshold based on distribution shape"""
+        
+        sorted_jsd = np.sort(jsd_values)
+        
+        if method == 'iqr':
+            # Use interquartile range - classic outlier detection
+            q1 = np.percentile(jsd_values, 25)
+            q3 = np.percentile(jsd_values, 75)
+            iqr = q3 - q1
+            
+            # Threshold = Q1 - 1.5*IQR (lower outliers = more specific)
+            threshold = q1 - 1.5 * iqr
+            
+            # Ensure threshold is positive
+            threshold = max(threshold, np.min(jsd_values) * 0.5)
+            
+            n_kept = np.sum(jsd_values <= threshold)
+            
+            print(f"  IQR-based threshold: {threshold:.2f}")
+            print(f"    Q1={q1:.2f}, Q3={q3:.2f}, IQR={iqr:.2f}")
+            print(f"    Keeps {n_kept}/{len(jsd_values)} TFs ({100*n_kept/len(jsd_values):.1f}%)")
+            
+        elif method == 'mad':
+            # Median Absolute Deviation - robust to outliers
+            median = np.median(jsd_values)
+            mad = np.median(np.abs(jsd_values - median))
+            
+            # For skewed distribution, use median - 2*MAD to get lower tail
+            threshold = median - 2 * mad
+            threshold = max(threshold, np.min(jsd_values) * 0.5)
+            
+            n_kept = np.sum(jsd_values <= threshold)
+            
+            print(f"  MAD-based threshold: {threshold:.2f}")
+            print(f"    Median={median:.2f}, MAD={mad:.2f}")
+            print(f"    Keeps {n_kept}/{len(jsd_values)} TFs ({100*n_kept/len(jsd_values):.1f}%)")
+        
+        elif method == 'top_n_percent':
+            # Simply take top N% most specific
+            percentile = 30  # adjust as needed
+            threshold = np.percentile(jsd_values, percentile)
+            n_kept = np.sum(jsd_values <= threshold)
+            
+            print(f"  Top {percentile}% threshold: {threshold:.2f}")
+            print(f"    Keeps {n_kept}/{len(jsd_values)} TFs")
+        
+        return threshold
+
     def filter_unique_expression(
         self, 
         tfs: Optional[List[str]] = None,
         jsd_threshold: float = None,
+        jsd_thresh_method: str = 'iqr',  # NEW: method for auto threshold
         top_n: int = None,
-        top_percentile: float = 75,
+        top_percentile: float = None,
         use_parallel: bool = True
     ) -> List[str]:
         """
@@ -371,7 +786,8 @@ class BaseTFIdentityPipeline(ABC):
         
         Args:
             tfs: List of TFs to evaluate (if None, uses all TFs)
-            jsd_threshold: Absolute threshold (e.g., score < threshold for specificity)
+            jsd_threshold: Absolute threshold (if None, auto-compute using jsd_method)
+            jsd_method: Method for auto threshold ('iqr', 'mad', 'top_n_percent')
             top_n: Select top N TFs by score (lowest scores)
             top_percentile: Select top percentile of TFs (e.g., 75 for lowest 25%)
             use_parallel: Whether to use parallel processing
@@ -380,6 +796,7 @@ class BaseTFIdentityPipeline(ABC):
             List of TF names with unique expression
         """
         method = self.jsd_method
+        top_percentile = self.top_jsd_pc 
         if tfs is None:
             tfs = self.tf_list
         
@@ -388,39 +805,33 @@ class BaseTFIdentityPipeline(ABC):
         
         if self.verbose:
             print(f"  Computing {method} divergence for {len(tfs_present)} TFs...")
-        
-        if use_parallel and len(tfs_present) > 20:  # Only parallelize if worth it
-            scores = self.multiprocess_jsd(tfs_present, method=method)
-        # else:
-        #     # Sequential computation for small gene sets
-        #     scores = {}
-        #     for tf in tqdm(tfs_present, disable=not self.verbose, desc=f"    Computing {method}"):
-        #         score = self._compute_jsd_specificity(
-        #             self.adata, tf, self.target_cell_type, self.cell_type_key, method=method
-        #         )
-        #         scores[tf] = score
-        
-        # For backward compatibility, always store as 'jsd_scores' too
+        if method != 'mmd':
+            if use_parallel and len(tfs_present) > 20:  # Only parallelize if worth it
+                scores = self.multiprocess_jsd(tfs_present, method=method)
+        else:
+            if use_parallel and len(tfs_present) > 20:
+                scores = self.multiprocess_mmd(tfs_present)
+
         self.results['jsd_scores'] = scores
         
         # Sort TFs by score - ASCENDING order (lower is better/more specific)
-        sorted_tfs = sorted(scores.items(), key=lambda x: x[1], reverse=False)  # Changed to False
+        sorted_tfs = sorted(scores.items(), key=lambda x: x[1], reverse=False)
         
         # Apply filtering based on provided criteria
         unique_tfs = []
         
         if jsd_threshold is not None:
             # Use absolute threshold - select scores BELOW threshold
-            unique_tfs = [tf for tf, score in sorted_tfs if score <= jsd_threshold]  # Changed to <=
+            unique_tfs = [tf for tf, score in sorted_tfs if score <= jsd_threshold]
             if self.verbose:
-                print(f"  {method} < {jsd_threshold}: {len(unique_tfs)} TFs")  # Changed to 
+                print(f"  {method} <= {jsd_threshold}: {len(unique_tfs)} TFs")
         
         elif top_n is not None:
             # Select top N (lowest scores)
             unique_tfs = [tf for tf, score in sorted_tfs[:min(top_n, len(sorted_tfs))]]
             if self.verbose and sorted_tfs:
-                max_score = sorted_tfs[min(top_n-1, len(sorted_tfs)-1)][1]  # Changed variable name
-                print(f"  Top {top_n} TFs ({method} <= {max_score:.3f})")  # Changed to <=
+                max_score = sorted_tfs[min(top_n-1, len(sorted_tfs)-1)][1]
+                print(f"  Top {top_n} TFs ({method} <= {max_score:.3f})")
         
         elif top_percentile is not None:
             # Select top percentile (lowest scores)
@@ -428,17 +839,20 @@ class BaseTFIdentityPipeline(ABC):
             n_select = max(1, n_select)  # At least 1
             unique_tfs = [tf for tf, score in sorted_tfs[:n_select]]
             if self.verbose and sorted_tfs:
-                max_score = sorted_tfs[min(n_select-1, len(sorted_tfs)-1)][1]  # Changed variable name
-                print(f"  Top {100-top_percentile}% TFs: {len(unique_tfs)} ({method} <= {max_score:.3f})")  # Changed to <=
+                max_score = sorted_tfs[min(n_select-1, len(sorted_tfs)-1)][1]
+                print(f"  Top {100-top_percentile}% TFs: {len(unique_tfs)} ({method} <= {max_score:.3f})")
         
         else:
-            # Default: use statistical threshold - select scores BELOW mean - 2*std
+            # Default: use data-driven statistical threshold
             if sorted_tfs:
                 scores_array = np.array([score for _, score in sorted_tfs])
-                threshold = np.mean(scores_array) - 2 * np.std(scores_array)  # Changed to minus
-                unique_tfs = [tf for tf, score in sorted_tfs if score <= threshold]  # Changed to <=
+                
+                # Use the simple threshold finder
+                threshold = self._find_jsd_threshold_simple(scores_array, method=jsd_thresh_method)
+                
+                unique_tfs = [tf for tf, score in sorted_tfs if score <= threshold]
                 if self.verbose:
-                    print(f"  {method} < mean-2std ({threshold:.3f}): {len(unique_tfs)} TFs")  # Changed to < and mean-2std
+                    print(f"  Data-driven threshold ({jsd_thresh_method}): {len(unique_tfs)} TFs selected")
             else:
                 unique_tfs = []
         
@@ -450,7 +864,6 @@ class BaseTFIdentityPipeline(ABC):
         
         return unique_tfs
 
-    
     def apply_core_filters(self) -> List[str]:
         """
         Apply both core filters: high expression AND uniqueness.
@@ -459,39 +872,79 @@ class BaseTFIdentityPipeline(ABC):
         Returns:
             List of TFs passing both core filters
         """
+
         if self.verbose:
             print("\n[Core Filtering]")
         #  Literal['high_only', 'unique_only', 'high_and_unique']
-        if self.main_filter == 'high_and_unique':
-            # Apply high expression filter
-            high_exp_tfs = self.filter_high_expression()
-            self.results['high_exp_tfs'] = high_exp_tfs
-            
-            # Apply uniqueness filter (on high expression TFs for efficiency)
-            unique_exp_tfs = self.filter_unique_expression(high_exp_tfs)
-            self.results['unique_exp_tfs'] = unique_exp_tfs
-            
-            # Core filtered = intersection
-            core_filtered = list(set(high_exp_tfs) & set(unique_exp_tfs))
-            self.results['core_filtered_tfs'] = core_filtered
-        elif self.main_filter == 'high_only':
-            high_exp_tfs = self.filter_high_expression()
-            self.results['high_exp_tfs'] = high_exp_tfs
-            self.results['unique_exp_tfs'] =  high_exp_tfs
-            core_filtered = list(set(high_exp_tfs) & set(unique_exp_tfs))
-            self.results['core_filtered_tfs'] = core_filtered
+        if self.top_n_jsd is not None:
+            if self.main_filter == 'high_and_unique':
+                # Apply high expression filter            
+                # Core filtered = intersection
+                high_exp_tfs = self.filter_high_expression()
+                unique_exp_tfs = self.filter_unique_expression(high_exp_tfs,top_n=self.top_n_jsd)
+                self.results['high_exp_tfs'] = high_exp_tfs
+                self.results['unique_exp_tfs'] = unique_exp_tfs
+                self.results['core_filtered_tfs'] = unique_exp_tfs
+            elif self.main_filter == 'high_only':
+                high_exp_tfs = self.filter_high_expression()
+                self.results['high_exp_tfs'] = high_exp_tfs
+                self.results['unique_exp_tfs'] =  high_exp_tfs
+                self.results['core_filtered_tfs'] = high_exp_tfs
+            else:
+                # Apply uniqueness filter (on high expression TFs for efficiency)
+                high_exp_tfs = self.tf_list
+                self.results['high_exp_tfs'] = high_exp_tfs
+                unique_exp_tfs = self.filter_unique_expression(high_exp_tfs, top_n=self.top_n_jsd)
+                self.results['unique_exp_tfs'] = unique_exp_tfs
+                self.results['core_filtered_tfs'] = unique_exp_tfs
+        elif self.top_jsd_pc is not None:
+            if self.main_filter == 'high_and_unique':
+                # Apply high expression filter            
+                # Core filtered = intersection
+                high_exp_tfs = self.filter_high_expression()
+                unique_exp_tfs = self.filter_unique_expression(high_exp_tfs,top_percentile=self.top_jsd_pc)
+                self.results['high_exp_tfs'] = high_exp_tfs
+                self.results['unique_exp_tfs'] = unique_exp_tfs
+                self.results['core_filtered_tfs'] = unique_exp_tfs
+            elif self.main_filter == 'high_only':
+                high_exp_tfs = self.filter_high_expression()
+                self.results['high_exp_tfs'] = high_exp_tfs
+                self.results['unique_exp_tfs'] =  high_exp_tfs
+                self.results['core_filtered_tfs'] = high_exp_tfs
+            else:
+                # Apply uniqueness filter (on high expression TFs for efficiency)
+                high_exp_tfs = self.tf_list
+                self.results['high_exp_tfs'] = high_exp_tfs
+                unique_exp_tfs = self.filter_unique_expression(high_exp_tfs, top_percentile=self.top_jsd_pc)
+                self.results['unique_exp_tfs'] = unique_exp_tfs
+                self.results['core_filtered_tfs'] = unique_exp_tfs
         else:
-            # Apply uniqueness filter (on high expression TFs for efficiency)
-            high_exp_tfs = self.tf_list
-            self.results['high_exp_tfs'] = high_exp_tfs
-            unique_exp_tfs = self.filter_unique_expression(high_exp_tfs)
-            self.results['unique_exp_tfs'] = unique_exp_tfs
-            core_filtered = list(set(high_exp_tfs) & set(unique_exp_tfs))
-            self.results['core_filtered_tfs'] = core_filtered
+            if self.main_filter == 'high_and_unique':
+                # Apply high expression filter            
+                # Core filtered = intersection
+                high_exp_tfs = self.filter_high_expression()
+                unique_exp_tfs = self.filter_unique_expression(high_exp_tfs)
+                self.results['high_exp_tfs'] = high_exp_tfs
+                self.results['unique_exp_tfs'] = unique_exp_tfs
+                self.results['core_filtered_tfs'] = list(
+                    set(high_exp_tfs) & set(unique_exp_tfs)
+                )
+            elif self.main_filter == 'high_only':
+                high_exp_tfs = self.filter_high_expression()
+                self.results['high_exp_tfs'] = high_exp_tfs
+                self.results['unique_exp_tfs'] =  high_exp_tfs
+                self.results['core_filtered_tfs'] = high_exp_tfs
+            else:
+                # Apply uniqueness filter (on high expression TFs for efficiency)
+                high_exp_tfs = self.tf_list
+                self.results['high_exp_tfs'] = high_exp_tfs
+                unique_exp_tfs = self.filter_unique_expression(high_exp_tfs)
+                self.results['unique_exp_tfs'] = unique_exp_tfs
+                self.results['core_filtered_tfs'] = unique_exp_tfs
         if self.verbose:
-            print(f"  Core filtered TFs (high & unique): {len(core_filtered)}")
+            print(f"Core filtered TFs (high & unique): {len(self.results['unique_exp_tfs'])}")
         
-        return core_filtered
+        return self.results['core_filtered_tfs'] 
     
     # ========================================================================
     # ABSTRACT METHODS FOR CHILD CLASSES
@@ -586,6 +1039,7 @@ class BaseTFIdentityPipeline(ABC):
             print("\n[Identity TF Selection]")
         identity_tfs = self.identify_key_tfs(graph, final_filtered_tfs)
         self.results['identity_tfs'] = identity_tfs
+        
         
         if self.verbose:
             print(f"  Identity TFs found: {len(identity_tfs)}")
