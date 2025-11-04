@@ -26,7 +26,7 @@ from typing import Dict, List, Tuple, Optional
 import torch
 import torch.nn as nn
 import time
-import src.Models.TFFilters.tf_base as tf_base
+
 
 # ============================================================================
 # VP-SDE COMPONENTS
