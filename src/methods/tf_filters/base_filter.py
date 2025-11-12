@@ -679,7 +679,7 @@ class BaseTFIdentityPipeline(ABC):
 
         adata_tfs = self.adata[:, tf_genes].copy()
         # Very fast implementation
-        sc.tl.rank_genes_groups(adata_tfs  , groupby='cell_type', 
+        sc.tl.rank_genes_groups(adata_tfs  , groupby=self.cell_type_key, 
                                 method='wilcoxon',
                                 reference='rest',
                                 groups=[self.target_cell_type])
@@ -700,9 +700,11 @@ class BaseTFIdentityPipeline(ABC):
         """
         if self.expr_method == 'scgx':
             tfs_high_df = pd.read_csv(self.scgx_sig_file, sep='\t')
-            high_tfs = tfs_high_df[
-                tfs_high_df['expr.level'].isin(['high', 'medium'])
-            ]['gene'].tolist()
+            iqr_thresh = np.percentile(tfs_high_df['not.0.perc'], 75) + 1.5*(np.percentile(tfs_high_df['not.0.perc'], 75) - np.percentile(tfs_high_df['not.0.perc'], 25)) 
+            high_tfs = tfs_high_df[tfs_high_df['not.0.perc'] > iqr_thresh]['gene'].tolist()
+            # high_tfs = tfs_high_df[
+            #     tfs_high_df['expr.level'].isin(['high', 'medium'])
+            # ]['gene'].tolist()
             
             # Filter to only include TFs from our TF list
             high_tfs = [tf for tf in high_tfs if tf in self.tf_list]
@@ -843,13 +845,17 @@ class BaseTFIdentityPipeline(ABC):
                 print(f"  Top {100-top_percentile}% TFs: {len(unique_tfs)} ({method} <= {max_score:.3f})")
         
         else:
-            # Default: use data-driven statistical threshold
+
+            # # Default: use data-driven statistical threshold
             if sorted_tfs:
-                scores_array = np.array([score for _, score in sorted_tfs])
+            #     scores_array = np.array([score for _, score in sorted_tfs])
                 
-                # Use the simple threshold finder
-                threshold = self._find_jsd_threshold_simple(scores_array, method=jsd_thresh_method)
-                
+            #     # Use the simple threshold finder
+            #     threshold = self._find_jsd_threshold_simple(scores_array, method=jsd_thresh_method)
+                all_jsd_scores = self.multiprocess_jsd(self.tf_list, method='geometric_jsd')
+                all_jsd_scores_df = pd.Series(all_jsd_scores).reset_index()
+                all_jsd_scores_df = all_jsd_scores_df[all_jsd_scores_df[0] >= 1]
+                threshold = np.percentile(all_jsd_scores_df[0], 75) - 1.5*(np.percentile(all_jsd_scores_df[0], 75) - np.percentile(all_jsd_scores_df[0], 25))
                 unique_tfs = [tf for tf, score in sorted_tfs if score <= threshold]
                 if self.verbose:
                     print(f"  Data-driven threshold ({jsd_thresh_method}): {len(unique_tfs)} TFs selected")
