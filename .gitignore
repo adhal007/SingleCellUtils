@@ -9,3 +9,6 @@
 *pyc*
 *checkpoint*
 __pycache__/
+*analysis_notebooks*
+*obo* 
+*owl*
