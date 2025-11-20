@@ -1,5 +1,6 @@
 ## 1. Codebase structure 
 
+```
 ├── demo_nb
 ├── src
 │   ├── methods
@@ -18,5 +19,5 @@
 │   ├── Plotter 
 └── readme.md
 └── LICENSE
-
+```
 
