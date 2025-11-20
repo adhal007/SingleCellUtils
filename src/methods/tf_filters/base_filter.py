@@ -17,6 +17,7 @@ import time
 from scipy.stats import pearsonr
 from tqdm import tqdm
 import warnings
+from collections import defaultdict
 warnings.filterwarnings('ignore')
 
 class BaseTFIdentityPipeline(ABC):
@@ -102,10 +103,13 @@ class BaseTFIdentityPipeline(ABC):
             'identity_tfs': None,
             'metrics': {}
         }
-        
+        self.n_group = self.adata[self.adata.obs[self.cell_type_key] == self.target_cell_type].shape[0]
+
         if self.verbose:
             self._print_initialization()
     
+
+
     def _prepare_jsd_data(self):
         """Pre-compute data needed for parallel JSD calculations."""
         # Pre-compute masks and indices
@@ -700,12 +704,12 @@ class BaseTFIdentityPipeline(ABC):
         """
         if self.expr_method == 'scgx':
             tfs_high_df = pd.read_csv(self.scgx_sig_file, sep='\t')
-            iqr_thresh = np.percentile(tfs_high_df['not.0.perc'], 75) + 1.5*(np.percentile(tfs_high_df['not.0.perc'], 75) - np.percentile(tfs_high_df['not.0.perc'], 25)) 
-            high_tfs = tfs_high_df[tfs_high_df['not.0.perc'] > iqr_thresh]['gene'].tolist()
-            # high_tfs = tfs_high_df[
-            #     tfs_high_df['expr.level'].isin(['high', 'medium'])
-            # ]['gene'].tolist()
-            
+            iqr_thresh = np.percentile(tfs_high_df['not.0.perc'], 25) + 1.5*(np.percentile(tfs_high_df['not.0.perc'], 75) - np.percentile(tfs_high_df['not.0.perc'], 25)) 
+            high_tfs_low = tfs_high_df[(tfs_high_df['not.0.perc'] > iqr_thresh) & (tfs_high_df['expr.level'] == 'low')]['gene'].tolist()
+            high_tfs = tfs_high_df[
+                tfs_high_df['expr.level'].isin(['high', 'medium'])
+            ]['gene'].tolist()
+            high_tfs += high_tfs_low
             # Filter to only include TFs from our TF list
             high_tfs = [tf for tf in high_tfs if tf in self.tf_list]
             
@@ -810,14 +814,14 @@ class BaseTFIdentityPipeline(ABC):
         if method != 'mmd':
             if use_parallel and len(tfs_present) > 20:  # Only parallelize if worth it
                 scores = self.multiprocess_jsd(tfs_present, method=method)
+                self.results['jsd_scores'] = scores
         else:
             if use_parallel and len(tfs_present) > 20:
                 scores = self.multiprocess_mmd(tfs_present)
+                self.results['jsd_scores'] = scores
 
-        self.results['jsd_scores'] = scores
-        
         # Sort TFs by score - ASCENDING order (lower is better/more specific)
-        sorted_tfs = sorted(scores.items(), key=lambda x: x[1], reverse=False)
+        sorted_tfs = sorted(self.results['jsd_scores'].items(), key=lambda x: x[1], reverse=False)
         
         # Apply filtering based on provided criteria
         unique_tfs = []
@@ -852,11 +856,17 @@ class BaseTFIdentityPipeline(ABC):
                 
             #     # Use the simple threshold finder
             #     threshold = self._find_jsd_threshold_simple(scores_array, method=jsd_thresh_method)
-                all_jsd_scores = self.multiprocess_jsd(self.tf_list, method='geometric_jsd')
-                all_jsd_scores_df = pd.Series(all_jsd_scores).reset_index()
-                all_jsd_scores_df = all_jsd_scores_df[all_jsd_scores_df[0] >= 1]
-                threshold = np.percentile(all_jsd_scores_df[0], 75) - 1.5*(np.percentile(all_jsd_scores_df[0], 75) - np.percentile(all_jsd_scores_df[0], 25))
-                unique_tfs = [tf for tf, score in sorted_tfs if score <= threshold]
+                # all_jsd_scores = self.multiprocess_jsd(self.tf_list, method='geometric_jsd')
+                # all_jsd_scores_df = pd.Series(all_jsd_scores).reset_index()
+                # all_jsd_scores_df = all_jsd_scores_df[all_jsd_scores_df[0] >= 1]
+                # self.all_jsd_scores_df = all_jsd_scores_df
+                # threshold = np.percentile(all_jsd_scores_df[0], 10)
+                # self.threshold = round(threshold,2)
+                # unique_tfs = [tf for tf, score in sorted_tfs if score <= threshold]
+                unique_tfs = self._compute_jsd_zscores(dict(sorted_tfs), method='geometric_jsd')
+                unique_tfs = [tf for tf, zscore in unique_tfs.items() if zscore <= -2.0]
+                # if len(unique_tfs) < 3:
+                #     unique_tfs = [tf for tf, score in sorted_tfs[:max(1, int(0.1*len(sorted_tfs)))]]
                 if self.verbose:
                     print(f"  Data-driven threshold ({jsd_thresh_method}): {len(unique_tfs)} TFs selected")
             else:
@@ -866,9 +876,75 @@ class BaseTFIdentityPipeline(ABC):
             print(f"  Unique expression TFs: {len(unique_tfs)}/{len(tfs_present)}")
             if sorted_tfs:
                 top_5 = sorted_tfs[:min(5, len(sorted_tfs))]
-                print(f"  Top 5 by {method} (most specific): {', '.join([f'{tf}({score:.2f})' for tf, score in top_5])}")
-        
+                print(f"  Top 5 by {method} (most specific): {', '.join([f'{tf}({score:.2f})' for tf, score in top_5])}")    
         return unique_tfs
+    
+    def _compute_jsd_zscores(self, sorted_tfs, method: str = 'geometric_jsd') -> float:
+        """Compute JSD threshold based on specified method."""
+        ref_jsd_across_iters = {}
+        for i in tqdm(range(100)):
+            random_cells = np.random.choice(self.adata.n_obs, size=self.n_target, replace=False)
+            adata_random = self.adata[random_cells, :]
+            gene_data_list = []
+            for gene in self.tf_list:
+                if gene not in adata_random.var_names:
+                    continue
+                
+                gene_idx = np.where(adata_random.var_names == gene)[0][0]
+                
+                # Extract expression for this gene
+                target_expr = self.X_target[:, gene_idx]
+                mu_other = self.mu_other_all[gene_idx]
+                
+                gene_data_list.append((gene, target_expr, self.n_target, mu_other))
+            
+            if not gene_data_list:
+                return {}
+            
+            # Create partial function with fixed method
+            compute_func = partial(self._compute_jsd_single_gene_parallel, method=method)
+            
+            # Parallel computation
+            if self.verbose:
+                print(f"    Using {self.n_processes} processes for {len(gene_data_list)} genes...")
+            
+            with Pool(processes=self.n_processes) as pool:
+                if self.verbose:
+                    # With progress bar
+                    results = list(tqdm(
+                        pool.imap(compute_func, gene_data_list, chunksize=self.chunk_size),
+                        total=len(gene_data_list),
+                        desc=f"    Parallel {method}",
+                        disable=False
+                    ))
+                else:
+                    # Without progress bar
+                    results = pool.map(compute_func, gene_data_list, chunksize=self.chunk_size)
+        
+            # Convert to dictionary
+            ref_jsd_scores = dict(results)
+            ref_jsd_across_iters[i] = ref_jsd_scores
+        
+        # Collect all values for each gene
+        gene_values = defaultdict(list)
+        for iter_dict in ref_jsd_across_iters.values():
+            for gene, value in iter_dict.items():
+                gene_values[gene].append(value)
+
+        # Compute mean and std
+        mean_dict = {gene: np.mean(values) for gene, values in gene_values.items()}
+        std_dict = {gene: np.std(values) for gene, values in gene_values.items()}
+        self.ref_jsd_mean = mean_dict 
+        self.ref_jsd_std = std_dict
+        # target_jsd_scores = self.multiprocess_jsd(self.tf_list, method='geometric_jsd')
+        target_jsd_zscores = {}
+        for key in sorted_tfs.keys():
+            target_jsd_zscore = (sorted_tfs[key] - mean_dict[key]) / std_dict[key] + 1e-10
+            target_jsd_zscores[key] = target_jsd_zscore
+ 
+        self.target_jsd_zscores = target_jsd_zscores
+        return self.target_jsd_zscores
+
 
     def apply_core_filters(self) -> List[str]:
         """
